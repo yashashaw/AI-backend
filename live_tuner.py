@@ -5,11 +5,14 @@ import sounddevice as sd
 from basic_pitch.inference import Model, ICASSP_2022_MODEL_PATH
 
 # --- CONFIGURATION ---
-SAMPLE_RATE = 22050 
-HOP_SIZE = 2048       
-WINDOW_LENGTH = 43844 
-THRESHOLD = 0.4            
-MIN_VOLUME_THRESHOLD = 0.01 
+SAMPLE_RATE = 22050
+HOP_SIZE = 2048         # The amount of new audio we process per step
+WINDOW_LENGTH = 43844   # The context length required by the model (~2 seconds)
+
+# Sensitivity
+NOTE_THRESHOLD = 0.4        # Confidence to sustain a note
+ONSET_THRESHOLD = 0.5       # Confidence to detect a NEW hit (attack)
+MIN_VOLUME_THRESHOLD = 0.01 # Microphone gate (raise this if noise triggers notes)
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
@@ -30,123 +33,129 @@ def select_microphone():
     except:
         return None
 
+def print_volume_bar(volume):
+    """Prints a visual volume bar to help debug microphone levels."""
+    bar_len = 30
+    fill = int(min(volume * 10, 1.0) * bar_len)
+    bar = '#' * fill + '-' * (bar_len - fill)
+    sys.stdout.write(f"\rVolume: [{bar}] {volume:.3f} ")
+    sys.stdout.flush()
+
 def main():
     device_id = select_microphone()
-    print("\nLoading Model...")
+    print("\nLoading Model (this may take a moment)...")
     try:
         model = Model(ICASSP_2022_MODEL_PATH)
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error loading model: {e}")
         return
 
-    print("Success! Logging notes... (Press Ctrl+C to stop)")
+    print("\nSuccess! Logging notes...")
+    print("Adjust your mic so typical playing hits 0.1 - 0.3 on the volume meter.")
+    print("Press Ctrl+C to stop.\n")
     print("-" * 50)
-    
-    # BUFFERS & STATE TRACKING
+
+    # BUFFERS
     audio_buffer = np.zeros((1, WINDOW_LENGTH, 1), dtype=np.float32)
     
-    # State variables for the logger
-    current_instance_id = 0
-    active_notes = set()       # The notes currently being logged
-    last_candidate_notes = set() # For stability check (debouncing)
-    stability_counter = 0      # How many frames the notes have held steady
-    
-    start_time_ref = time.time() # Reference time (0ms)
+    # STATE TRACKING
+    active_notes = {}  # Dict mapping midi_number -> start_time
+    instance_id = 0
+    start_time_ref = time.time()
 
     def callback(indata, frames, time_info, status):
-        nonlocal audio_buffer, active_notes, current_instance_id
-        nonlocal last_candidate_notes, stability_counter
+        nonlocal audio_buffer, active_notes, instance_id
         
-        if status: print(status, file=sys.stderr)
+        if status:
+            print(status, file=sys.stderr)
 
         new_data = indata.astype(np.float32)
         
-        # 1. Volume Gate
+        # 1. Volume Gate & Debug
         volume = np.sqrt(np.mean(new_data**2))
-        if new_data.shape[0] > WINDOW_LENGTH: return 
-        
+        print_volume_bar(volume)
+
         # Shift Buffer
         audio_buffer = np.roll(audio_buffer, -frames, axis=1)
         audio_buffer[0, -frames:, :] = new_data
         
-        # If silent, assume no notes (skip AI to save CPU)
+        # Skip AI processing if silence (saves CPU)
         if volume < MIN_VOLUME_THRESHOLD:
-            detected_notes = set()
-        else:
-            # Run AI
-            try:
-                output = model.predict(audio_buffer)
-            except:
-                return
+            # If we were tracking notes, clear them because of silence
+            if active_notes:
+                print(f"\n[Silence] All notes ended.")
+                active_notes = {}
+            return
 
-            if isinstance(output, list):
-                probs = output[0]
-            else:
-                probs = output['note']
+        # 2. Run AI Inference
+        try:
+            output = model.predict(audio_buffer)
+        except Exception:
+            return
 
-            if probs is None: 
-                detected_notes = set()
-            else:
-                probs = np.squeeze(probs) 
-                max_probs = np.max(probs, axis=0) 
-                
-                # Logic: Polyphonic + Harmonic Pruning
-                candidates = np.where(max_probs > THRESHOLD)[0]
-                candidates = sorted(candidates)
-                final_indices = []
-                for note_idx in candidates:
-                    current_prob = max_probs[note_idx]
-                    octave_down = note_idx - 12
-                    is_ghost = False
-                    if octave_down in candidates:
-                        if max_probs[octave_down] > (current_prob * 0.5):
-                            is_ghost = True
-                    if not is_ghost:
-                        final_indices.append(note_idx)
+        # Output format is dictionary with keys: 'note', 'onset', 'contour'
+        # Shape: (batch, time_frames, 88_notes)
+        note_probs = output['note']
+        onset_probs = output['onset']
 
-                detected_notes = set()
-                for index in final_indices:
-                    midi_num = index + 21
-                    detected_notes.add(midi_to_note_name(midi_num))
+        if note_probs is None: 
+            return
 
-        # --- LOGGING LOGIC WITH STABILITY CHECK ---
+        # --- KEY FIX: TEMPORAL SLICING ---
+        # Instead of looking at the whole 2-second buffer, look only at the 
+        # last 3 frames (approx last 30-50ms) which corresponds to the NEW audio.
+        # We assume 3 frames is enough to be stable but fast enough to catch rapid notes.
+        focus_window_size = 5 
         
-        # Only change state if the AI sees the SAME notes for 2 frames in a row
-        # This prevents "Instance 5: [C]" -> "Instance 6: [C, D]" -> "Instance 7: [C]" flickering
-        if detected_notes == last_candidate_notes:
-            stability_counter += 1
-        else:
-            stability_counter = 0
-            last_candidate_notes = detected_notes
+        # Get max probability in the "Now" window
+        current_notes_max = np.max(note_probs[0, -focus_window_size:, :], axis=0)
+        current_onsets_max = np.max(onset_probs[0, -focus_window_size:, :], axis=0)
 
-        # If stable enough (approx 20-50ms stable), we accept the change
-        if stability_counter >= 2: 
+        # 3. Process Notes
+        # We scan all 88 piano keys (MIDI 21 to 108)
+        detected_this_frame = set()
+
+        for i in range(88):
+            midi_num = i + 21
+            prob_note = current_notes_max[i]
+            prob_onset = current_onsets_max[i]
             
-            # Check if the "Stable" notes are different from the "Logged" notes
-            if detected_notes != active_notes:
+            # CONDITION 1: Note is loud enough to be considered "Sustaining"
+            is_sustaining = prob_note > NOTE_THRESHOLD
+            
+            # CONDITION 2: Note is being "Attacked" (Hit freshly)
+            is_attack = prob_onset > ONSET_THRESHOLD
+
+            if is_sustaining:
+                detected_this_frame.add(midi_num)
                 
-                current_time_ms = int((time.time() - start_time_ref) * 1000)
+                # LOGIC: If note is already active, but we detect a NEW ATTACK, restart it.
+                if midi_num in active_notes and is_attack:
+                    # Note re-articulation (e.g. playing the same chord twice quickly)
+                    old_timestamp = active_notes[midi_num]
+                    # Only re-trigger if some time has passed (debounce fast glitches, e.g., 100ms)
+                    if (time.time() - old_timestamp) > 0.1:
+                        print(f"\nRE-TRIGGER: {midi_to_note_name(midi_num)}")
+                        active_notes[midi_num] = time.time()
                 
-                # 1. End previous instance (if it wasn't silence)
-                if len(active_notes) > 0:
-                    print(f"time: {current_time_ms} ms | instance {current_instance_id} ended")
-                
-                # 2. Start new instance (if not silence)
-                if len(detected_notes) > 0:
-                    current_instance_id += 1
-                    sorted_notes = sorted(list(detected_notes))
-                    print(f"Instance {current_instance_id}: time: {current_time_ms} ms | notes: {sorted_notes}")
-                
-                # 3. Update State
-                active_notes = detected_notes
-                
-                # Add a visual separator if we went to silence
-                if len(detected_notes) == 0:
-                    print("-" * 20)
+                # LOGIC: New Note
+                elif midi_num not in active_notes:
+                    current_ms = int((time.time() - start_time_ref) * 1000)
+                    active_notes[midi_num] = time.time()
+                    print(f"\n[{current_ms}ms] Note ON: {midi_to_note_name(midi_num)}")
+
+        # 4. Handle Note Offs
+        # If a note was active but is no longer detected in the current frame
+        active_ids = list(active_notes.keys())
+        for midi_num in active_ids:
+            if midi_num not in detected_this_frame:
+                print(f"\nNote OFF: {midi_to_note_name(midi_num)}")
+                del active_notes[midi_num]
 
     try:
+        # Reduced blocksize slightly for better responsiveness (optional)
         with sd.InputStream(device=device_id, channels=1, samplerate=22050, 
-                            blocksize=2048, callback=callback):
+                            blocksize=HOP_SIZE, callback=callback):
             while True: sd.sleep(1000)
     except KeyboardInterrupt:
         print("\nLog Stopped.")
