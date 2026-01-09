@@ -12,7 +12,7 @@ WINDOW_LENGTH = 43844   # The context length required by the model (~2 seconds)
 # Sensitivity
 NOTE_THRESHOLD = 0.4        # Confidence to sustain a note
 ONSET_THRESHOLD = 0.5       # Confidence to detect a NEW hit (attack)
-MIN_VOLUME_THRESHOLD = 0.01 # Microphone gate (raise this if noise triggers notes)
+MIN_VOLUME_THRESHOLD = 0.001 # Microphone gate (raise this if noise triggers notes)
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
